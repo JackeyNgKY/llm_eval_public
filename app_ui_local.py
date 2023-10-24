@@ -11,8 +11,6 @@ from langchain.storage._lc_store import create_kv_docstore
 from dotenv import load_dotenv
 from htmlTemplates import bot_template, user_template
 from langchain.llms import LlamaCpp
-from langchain.callbacks.manager import CallbackManager
-from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain.retrievers.document_compressors import LLMChainExtractor
@@ -86,6 +84,12 @@ def main():
         else:
             st.session_state.use_mq_retriever = False
 
+        on_use_compressor = st.toggle("Compressor Sources")
+        if on_use_compressor:
+            st.session_state.use_compressor = True
+        else:
+            st.session_state.use_compressor = False
+
 
         if st.button("clear chat history"):
             st.cache_data.clear()
@@ -94,8 +98,7 @@ def main():
 
 def init():
     load_dotenv()
-    get_doc_retriever()
-    get_doc_retriever_multi_q()
+    get_base_retriever()
     get_llm()
     st.title("Banking Compliance Bot")
     tab1, tab2 = st.tabs(["Current Chat","Chat History"])
@@ -105,6 +108,8 @@ def init():
     # Initialize session data
     if "display_source" not in st.session_state:
         st.session_state.display_source = False
+    if "use_compressor" not in st.session_state:
+        st.session_state.use_compressor = False
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "use_mq_retriever" not in st.session_state:
@@ -126,14 +131,27 @@ def load_mem_store(file_path):
     mem_store = create_kv_docstore(fs)
     return mem_store
 
-@st.cache_resource
 def get_doc_retriever():
+    return get_base_retriever()
+
+
+def add_multi_q_to_retriever(retriever):
+    llm = get_llm_for_compressor()
+    retriever_from_llm = MultiQueryRetriever.from_llm(retriever=retriever, llm=llm)
+    return retriever_from_llm
+
+
+def add_compressor_to_retriever(retriever):
+    llm = get_llm_for_compressor()
+    compressor = LLMChainExtractor.from_llm(llm)
+    compression_retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=retriever)
+    return compression_retriever
+
+@st.cache_resource
+def get_base_retriever():
     vec_db = load_vec_db(os.environ["vec_db_index"])
     mem_store = load_mem_store(os.environ["mem_store_path"])
     max_doc_retrieved=int(os.environ["max_num_docs_local"])
-    # llm = VertexAI(model_name="text-bison", max_output_tokens=1000, temperature=0.1, top_k=40, top_p=0.8)
-    llm = get_llm()
-    compressor = LLMChainExtractor.from_llm(llm)
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=200)
     retriever = ParentDocumentRetriever(
@@ -144,50 +162,28 @@ def get_doc_retriever():
     search_kwargs={"k":max_doc_retrieved}
     )
     return retriever
-    # compression_retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=retriever)
-    # return compression_retriever
-
-@st.cache_resource
-def get_doc_retriever_multi_q():
-    vec_db = load_vec_db(os.environ["vec_db_index"])
-    mem_store = load_mem_store(os.environ["mem_store_path"])
-    max_doc_retrieved=int(os.environ["max_num_docs_local"])
-    llm = get_llm()
-    compressor = LLMChainExtractor.from_llm(llm)
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=200)
-    retriever = ParentDocumentRetriever(
-    vectorstore=vec_db, 
-    docstore=mem_store, 
-    child_splitter=child_splitter,
-    parent_splitter=parent_splitter,
-    search_kwargs={"k":max_doc_retrieved}
-    )
-    retriever_from_llm = MultiQueryRetriever.from_llm(retriever=retriever, llm=llm)
-    compression_retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=retriever_from_llm)
-    return compression_retriever
-
 
 @st.cache_resource
 def get_llm():
-    n_gpu_layers = 32  # Change this value based on your model and your GPU VRAM pool.
-    n_batch = 4096  # Should be between 1 and n_ctx, consider the amount of VRAM in your GPU.
+    return get_llm_with_Params(4096,512,0.2)
 
-    callback_manager = CallbackManager([StreamingStdOutCallbackHandler()])
-    # Make sure the model path is correct for your system!
+@st.cache_resource
+def get_llm_for_compressor():
+    return get_llm_with_Params(4096,128,0.2)
+
+def get_llm_with_Params(max_ctx, max_output, temp):
+    n_gpu_layers = 32  # Change this value based on your model and your GPU VRAM pool.
+    n_batch = max_ctx  # Should be between 1 and n_ctx, consider the amount of VRAM in your GPU.
     llm = LlamaCpp(
-    model_path="/Users/jackeyng/Projects/llama/cpp/llama.cpp/models/7B/ggml-model-q4_0.gguf",
+    model_path="/Users/jackeyng/Projects/llama/cpp/llama.cpp/models/M7B/ggml-model-q4_0.gguf",
     n_gpu_layers=n_gpu_layers,
     n_batch=n_batch,
-    n_ctx=4096,
-    temperature=0.2,
-    max_tokens=1024,
+    n_ctx=max_ctx,
+    temperature=temp,
+    max_tokens=max_output,
     top_p=0.8,
-    top_k=40,
-    # callback_manager=callback_manager,
-    # verbose=True
-    )
-    # llm = VertexAI(model_name="text-bison", max_output_tokens=1000, temperature=0.1, top_k=40, top_p=0.8)
+    top_k=40)
+
     return llm
 
 def remove_html_tags(text):
@@ -229,11 +225,12 @@ def format_response_for_sources(docs):
 
 @st.cache_data
 def handle_user_request(user_question):
-    retriever = None
+    retriever = get_doc_retriever()
     if st.session_state.use_mq_retriever:
-        retriever = get_doc_retriever_multi_q()
-    else:
-        retriever = get_doc_retriever()
+        retriever = add_multi_q_to_retriever(retriever)
+    if st.session_state.use_compressor:
+        retriever = add_compressor_to_retriever(retriever)
+    
     print_time("Retrieving relevant documents")
     docs=retriever.get_relevant_documents(user_question)
     print_time("Retrieved relevant documents")
